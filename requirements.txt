@@ -1,0 +1,11 @@
+torch>=2.0
+numpy
+pandas
+# prody
+scikit-learn
+matplotlib
+seaborn
+tqdm
+nglview # optional, for 3-D visualisation 
+# ipywidgets # optional, for Jupyter integration
+# rdkit

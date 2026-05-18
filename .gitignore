@@ -1,0 +1,21 @@
+*.pyc
+sru*
+/embedding
+.vscode
+# Models and Checkpoints
+ckpts/
+*.allatom
+*.pt
+*.pth
+
+# Datasets and Results
+data/
+test_data/
+results/
+*.pkl
+*.csv
+*.jsonl
+
+# Python environments
+__pycache__/
+.venv/
