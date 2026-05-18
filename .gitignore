@@ -3,10 +3,6 @@ sru*
 /embedding
 .vscode
 # Models and Checkpoints
-ckpts/
-*.allatom
-*.pt
-*.pth
 
 # Datasets and Results
 data/
