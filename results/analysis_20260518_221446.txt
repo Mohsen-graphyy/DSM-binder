@@ -1,0 +1,23 @@
+DSMBind Evaluation Analysis
+Run ID  : 20260518_221446
+File    : C:\Users\hajmo\OneDrive\Desktop\Mohsen Pro Developer\DSMBind\results\predictions_20260518_221446.csv
+Samples : 988
+Labeled : yes
+
+======================================================================
+Per-group results
+======================================================================
+
+  Task: antibody  |  Dataset: HER2  |  Checkpoint: model.antibody.allatom
+    n               = 422
+    Spearman R      = 0.2523  (p=1.49e-07)
+    Pearson R       = 0.2609
+    RMSE            = 2792.8988
+    Top-10% recall  = 0.0238
+
+  Task: antibody  |  Dataset: sabdab  |  Checkpoint: model.antibody.allatom
+    n               = 566
+    Spearman R      = 0.3605  (p=8.26e-19)
+    Pearson R       = 0.3589
+    RMSE            = 4258.8085
+    Top-10% recall  = 0.0179

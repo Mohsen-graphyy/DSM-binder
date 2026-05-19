@@ -1,0 +1,18 @@
+{
+  "run_id": "20260518_221446",
+  "timestamp": "2026-05-19T00:31:39.268090",
+  "results": [
+    {
+      "tag": "antibody | sabdab | model.antibody.allatom",
+      "n": 566,
+      "spearman_r": 0.3604719847676293,
+      "pearson_r": 0.35888496837674844
+    },
+    {
+      "tag": "antibody | HER2 | model.antibody.allatom",
+      "n": 422,
+      "spearman_r": 0.25233331923404967,
+      "pearson_r": 0.26086878586016565
+    }
+  ]
+}

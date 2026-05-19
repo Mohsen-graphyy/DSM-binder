@@ -7,10 +7,7 @@ sru*
 # Datasets and Results
 data/
 test_data/
-results/
-*.pkl
-*.csv
-*.jsonl
+
 
 # Python environments
 __pycache__/
