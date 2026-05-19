@@ -143,13 +143,54 @@ def save_regplot(scores, labels, title: str, out_path: Path):
     plt.close()
 
 
+# ── Embedding cache ───────────────────────────────────────────────────────────
+
+
+def _embed_cache_path(data: list, fields: list, cache_dir: Path) -> Path:
+    """Stable cache filename based on a content hash of all embedded sequences."""
+    import hashlib
+    seqs = sorted({d[f] for d in data for f in fields if d.get(f)})
+    h = hashlib.md5("\n".join(seqs).encode()).hexdigest()[:10]
+    tag = "_".join(fields)
+    return cache_dir / f"esm_{tag}_{h}.pt"
+
+
+def get_embeddings(data: list, fields: list, cache_dir: Path) -> dict:
+    """
+    Return ESM embeddings for all sequences in *data[fields]*.
+
+    On first call the embeddings are computed (slow on CPU) and written to a
+    .pt file in *cache_dir*.  Every subsequent call with the same data loads
+    the cache instantly — no re-computation.
+    """
+    from bindenergy.utils.ioutils import load_esm_embedding
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = _embed_cache_path(data, fields, cache_dir)
+
+    if cache_path.exists():
+        print(f"[embed cache] Loading from {cache_path.name} ...")
+        return torch.load(cache_path, map_location="cpu", weights_only=False)
+
+    n_seqs = len({d[f] for d in data for f in fields if d.get(f)})
+    print(
+        f"[embed cache] Computing ESM embeddings for {n_seqs} unique sequences "
+        f"(fields: {fields}).\n"
+        f"              This is slow on CPU. Result will be cached to:\n"
+        f"              {cache_path.resolve()}"
+    )
+    embedding = load_esm_embedding(data, fields)
+    torch.save(embedding, cache_path)
+    print(f"[embed cache] Saved -> {cache_path.name}")
+    return embedding
+
+
 # ── Task: Drug / Ligand ───────────────────────────────────────────────────────
 
 
 def evaluate_drug(parsed_args, device, ckpt_paths, out_dir: Path):
     from bindenergy.models.drug import DrugAllAtomEnergyModel
     from bindenergy.data.drug import DrugDataset
-    from bindenergy.utils.ioutils import load_esm_embedding  # noqa (ioutils re-export)
 
     # Resolve datasets
     if parsed_args.data:
@@ -175,7 +216,7 @@ def evaluate_drug(parsed_args, device, ckpt_paths, out_dir: Path):
         return [], []
 
     all_data = [entry for ds in datasets.values() for entry in ds.data]
-    embedding = load_esm_embedding(all_data, ["target_seq"])
+    embedding = get_embeddings(all_data, ["target_seq"], out_dir / "cache")
 
     rows, summaries = [], []
 
@@ -233,7 +274,6 @@ def evaluate_drug(parsed_args, device, ckpt_paths, out_dir: Path):
 def evaluate_antibody(parsed_args, device, ckpt_paths, out_dir: Path):
     from bindenergy.models.energy import AllAtomEnergyModel
     from bindenergy.data.antibody import AntibodyDataset
-    from bindenergy.utils.ioutils import load_esm_embedding
 
     cdr_type = parsed_args.cdr_type
 
@@ -259,7 +299,7 @@ def evaluate_antibody(parsed_args, device, ckpt_paths, out_dir: Path):
         return [], []
 
     all_data = [entry for ds in datasets.values() for entry in ds.data]
-    embedding = load_esm_embedding(all_data, ["antibody_seq", "antigen_seq"])
+    embedding = get_embeddings(all_data, ["antibody_seq", "antigen_seq"], out_dir / "cache")
 
     rows, summaries = [], []
 
@@ -318,7 +358,6 @@ def evaluate_antibody(parsed_args, device, ckpt_paths, out_dir: Path):
 def evaluate_protein(parsed_args, device, ckpt_paths, out_dir: Path):
     from bindenergy.models.energy import AllAtomEnergyModel
     from bindenergy.data.protein import ProteinDataset
-    from bindenergy.utils.ioutils import load_esm_embedding
 
     data_path = parsed_args.data or "data/skempi/skempi_all.pkl"
     if not os.path.exists(data_path):
@@ -327,7 +366,22 @@ def evaluate_protein(parsed_args, device, ckpt_paths, out_dir: Path):
 
     ds_name = Path(data_path).stem
     dataset = ProteinDataset(data_path, parsed_args.patch_size)
-    embedding = load_esm_embedding(dataset.data, ["binder_full", "target_full"])
+
+    # Dataset statistics (helps the user understand the workload up-front)
+    wt_entries  = [e for e in dataset.data if len(e["pdb"][1]) == 0]
+    mut_entries = [e for e in dataset.data if len(e["pdb"][1]) > 0]
+    print(
+        f"\nDataset: {len(dataset.data)} valid entries "
+        f"({len(wt_entries)} wild-type, {len(mut_entries)} mutants)"
+    )
+
+    embedding = get_embeddings(
+        dataset.data, ["binder_full", "target_full"], out_dir / "cache"
+    )
+
+    # Partial-results file so an interrupt doesn't lose all progress
+    partial_path = out_dir / f"partial_protein_{ds_name}.csv"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     rows, summaries = [], []
 
@@ -341,34 +395,56 @@ def evaluate_protein(parsed_args, device, ckpt_paths, out_dir: Path):
         tag = f"protein | {ds_name} | {ckpt_name}"
 
         with torch.no_grad():
-            # First pass: wild-type energies
+            # Pass 1: wild-type energies (now visible with its own progress bar)
             wt_energy = {}
-            for entry in dataset.data:
-                pdb, mutation, _ddg = entry["pdb"]
-                if len(mutation) == 0:
-                    binder, target = ProteinDataset.make_local_batch(
-                        [entry], embedding, model_args, "binder", "target"
-                    )
-                    wt_energy[pdb] = model.predict(binder, target) + model.predict(
-                        target, binder
-                    )
+            for entry in tqdm(wt_entries, desc=f"  WT energies [{ckpt_name}]"):
+                pdb, _mut, _ddg = entry["pdb"]
+                binder, target = ProteinDataset.make_local_batch(
+                    [entry], embedding, model_args, "binder", "target"
+                )
+                wt_energy[pdb] = (
+                    model.predict(binder, target) + model.predict(target, binder)
+                )
 
-            # Second pass: mutant energies → ΔΔG prediction
+            # Pass 2: mutant ΔΔG — saves a partial CSV every 100 samples
             scores, labels, pdb_ids = [], [], []
-            for entry in tqdm(dataset.data, desc=f"protein/{ds_name} [{ckpt_name}]"):
+            partial_rows = []
+            for i, entry in enumerate(
+                tqdm(mut_entries, desc=f"  Mutants [{ckpt_name}]")
+            ):
                 pdb, mutation, ddg = entry["pdb"]
-                if len(mutation) > 0 and pdb in wt_energy:
-                    binder, target = ProteinDataset.make_local_batch(
-                        [entry], embedding, model_args, "binder", "target"
-                    )
-                    score = (
-                        model.predict(binder, target)
-                        + model.predict(target, binder)
-                        - wt_energy[pdb]
-                    )
-                    scores.append(-score.item())
-                    labels.append(ddg)
-                    pdb_ids.append(f"{pdb}_{mutation}")
+                if pdb not in wt_energy:
+                    continue
+                binder, target = ProteinDataset.make_local_batch(
+                    [entry], embedding, model_args, "binder", "target"
+                )
+                score = (
+                    model.predict(binder, target)
+                    + model.predict(target, binder)
+                    - wt_energy[pdb]
+                )
+                s = -score.item()
+                scores.append(s)
+                labels.append(ddg)
+                pid = f"{pdb}_{mutation}"
+                pdb_ids.append(pid)
+                partial_rows.append(
+                    {
+                        "pdb_id": pid,
+                        "task": "protein",
+                        "dataset": ds_name,
+                        "checkpoint": ckpt_name,
+                        "predicted_score": s,
+                        "label": ddg,
+                    }
+                )
+                # Flush partial results every 100 samples
+                if (i + 1) % 100 == 0:
+                    pd.DataFrame(partial_rows).to_csv(partial_path, index=False)
+            # Final flush
+            if partial_rows:
+                pd.DataFrame(partial_rows).to_csv(partial_path, index=False)
+                print(f"  Partial results saved -> {partial_path.resolve()}")
 
         for i, pid in enumerate(pdb_ids):
             rows.append(
