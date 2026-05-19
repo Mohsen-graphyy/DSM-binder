@@ -120,12 +120,12 @@ def compute_auc(scores, binary_labels) -> dict:
 
 
 def print_metrics(tag: str, metrics: dict):
-    print(f"\n{'─' * 55}")
+    print(f"\n{'-' * 55}")
     print(f"  {tag}")
     for k, v in metrics.items():
         val = f"{v:.4f}" if isinstance(v, float) else str(v)
         print(f"    {k}: {val}")
-    print(f"{'─' * 55}")
+    print(f"{'-' * 55}")
 
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
@@ -399,23 +399,194 @@ def evaluate_protein(parsed_args, device, ckpt_paths, out_dir: Path):
 # ── Persistence ───────────────────────────────────────────────────────────────
 
 
-def save_outputs(rows, summaries, out_dir: Path, run_id: str):
+def save_outputs(rows, summaries, out_dir: Path, run_id: str) -> Path:
+    """Write predictions CSV and summary JSON. Returns the CSV path."""
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Always write the CSV (empty DataFrame if no rows, so the file always exists)
     csv_path = out_dir / f"predictions_{run_id}.csv"
-    if rows:
-        pd.DataFrame(rows).to_csv(csv_path, index=False)
-        print(f"\nPredictions → {csv_path}")
+    pd.DataFrame(rows if rows else []).to_csv(csv_path, index=False)
+    print(f"\nPredictions -> {csv_path.resolve()}")
 
+    # Always write the JSON summary
     summary_path = out_dir / f"summary_{run_id}.json"
     payload = {
         "run_id": run_id,
         "timestamp": datetime.now().isoformat(),
         "results": summaries,
     }
-    with open(summary_path, "w") as f:
+    with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
-    print(f"Summary    → {summary_path}")
+    print(f"Summary    -> {summary_path.resolve()}")
+
+    return csv_path
+
+
+# ── Analysis ─────────────────────────────────────────────────────────────────
+
+
+def analyze_results(csv_path: Path, out_dir: Path, run_id: str):
+    """
+    Read the predictions CSV and produce:
+      - A formatted text report  (results/analysis_<run_id>.txt)
+      - A checkpoint-comparison bar chart  (results/plots/comparison_<run_id>.png)
+
+    Metrics computed per (task, dataset, checkpoint) group:
+      n, Spearman R, Spearman p-value, Pearson R, RMSE,
+      top-10% recall (fraction of true top-10% binders ranked in top-10% by score)
+    """
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        print("No predictions to analyze.")
+        return
+
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        print("Predictions CSV is empty - nothing to analyze.")
+        return
+
+    has_labels = df["label"].notna().all()
+    groups = ["task", "dataset", "checkpoint"]
+
+    report_lines = [
+        f"DSMBind Evaluation Analysis",
+        f"Run ID  : {run_id}",
+        f"File    : {csv_path.resolve()}",
+        f"Samples : {len(df)}",
+        f"Labeled : {'yes' if has_labels else 'no (scores only)'}",
+        "",
+    ]
+
+    # ── Per-group metrics table ───────────────────────────────────────────────
+    group_records = []
+
+    for key, gdf in df.groupby(groups):
+        task, dataset, ckpt = key
+        scores = gdf["predicted_score"].to_numpy()
+        rec = {"task": task, "dataset": dataset, "checkpoint": ckpt, "n": len(scores)}
+
+        if has_labels and gdf["label"].notna().all():
+            labels = gdf["label"].to_numpy()
+            sp = scipy.stats.spearmanr(scores, labels)
+            pr = scipy.stats.pearsonr(scores, labels)
+            rmse = float(np.sqrt(np.mean((scores - labels) ** 2)))
+
+            # Top-10% recall: how many true top-10% binders are predicted in top-10%
+            k = max(1, len(scores) // 10)
+            # Lower label = tighter binding; higher score = better predicted binding
+            true_top  = set(np.argsort(labels)[:k])          # smallest labels
+            pred_top  = set(np.argsort(scores)[-k:])          # largest scores
+            recall_10 = len(true_top & pred_top) / k
+
+            rec.update({
+                "spearman_r": round(float(sp.statistic), 4),
+                "spearman_p": float(sp.pvalue),
+                "pearson_r":  round(float(pr[0]), 4),
+                "rmse":       round(rmse, 4),
+                "top10_recall": round(recall_10, 4),
+            })
+        group_records.append(rec)
+
+    # Print/write the per-group table
+    report_lines.append("=" * 70)
+    report_lines.append("Per-group results")
+    report_lines.append("=" * 70)
+    for r in group_records:
+        report_lines.append(
+            f"\n  Task: {r['task']}  |  Dataset: {r['dataset']}  |  Checkpoint: {r['checkpoint']}"
+        )
+        report_lines.append(f"    n               = {r['n']}")
+        if "spearman_r" in r:
+            p_str = f"{r['spearman_p']:.2e}"
+            report_lines.append(f"    Spearman R      = {r['spearman_r']:.4f}  (p={p_str})")
+            report_lines.append(f"    Pearson R       = {r['pearson_r']:.4f}")
+            report_lines.append(f"    RMSE            = {r['rmse']:.4f}")
+            report_lines.append(f"    Top-10% recall  = {r['top10_recall']:.4f}")
+
+    # ── Cross-checkpoint comparison table ─────────────────────────────────────
+    if has_labels and len(group_records) > 1:
+        ckpts_all    = sorted({r["checkpoint"] for r in group_records})
+        datasets_all = sorted({f"{r['task']}/{r['dataset']}" for r in group_records})
+
+        if len(ckpts_all) > 1:
+            report_lines.append("")
+            report_lines.append("=" * 70)
+            report_lines.append("Checkpoint comparison (Spearman R)")
+            report_lines.append("=" * 70)
+            col_w = max(25, max(len(c) for c in ckpts_all) + 2)
+            row_w = max(20, max(len(d) for d in datasets_all) + 2)
+            header = f"{'Dataset':<{row_w}}" + "".join(f"{c:<{col_w}}" for c in ckpts_all)
+            report_lines.append(header)
+            report_lines.append("-" * len(header))
+            idx = {(r["task"] + "/" + r["dataset"], r["checkpoint"]): r.get("spearman_r", float("nan"))
+                   for r in group_records}
+            for ds in datasets_all:
+                row = f"{ds:<{row_w}}"
+                for c in ckpts_all:
+                    val = idx.get((ds, c), float("nan"))
+                    row += f"{val:<{col_w}.4f}" if not np.isnan(val) else f"{'N/A':<{col_w}}"
+                report_lines.append(row)
+
+    # ── Save text report ──────────────────────────────────────────────────────
+    report_path = out_dir / f"analysis_{run_id}.txt"
+    report_text = "\n".join(report_lines)
+    print(report_text)
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(report_text + "\n")
+    print(f"\nAnalysis report -> {report_path.resolve()}")
+
+    # ── Comparison bar chart ──────────────────────────────────────────────────
+    if not has_labels or "spearman_r" not in group_records[0]:
+        return
+
+    gdf_plot = pd.DataFrame(group_records)
+    gdf_plot = gdf_plot[gdf_plot["spearman_r"].notna()]
+    if gdf_plot.empty:
+        return
+
+    tasks_present = gdf_plot["task"].unique()
+    n_tasks = len(tasks_present)
+    fig, axes = plt.subplots(1, n_tasks, figsize=(6 * n_tasks, 4), squeeze=False)
+
+    for ax, task in zip(axes[0], tasks_present):
+        sub = gdf_plot[gdf_plot["task"] == task]
+        ckpts_sub    = sub["checkpoint"].unique()
+        datasets_sub = sub["dataset"].unique()
+
+        x = np.arange(len(datasets_sub))
+        bar_w = 0.8 / max(len(ckpts_sub), 1)
+
+        for i, ck in enumerate(ckpts_sub):
+            vals = [
+                sub[(sub["dataset"] == ds) & (sub["checkpoint"] == ck)]["spearman_r"].values
+                for ds in datasets_sub
+            ]
+            vals = [v[0] if len(v) else float("nan") for v in vals]
+            offset = (i - len(ckpts_sub) / 2 + 0.5) * bar_w
+            bars = ax.bar(x + offset, vals, bar_w, label=ck, alpha=0.85)
+            for bar, val in zip(bars, vals):
+                if not np.isnan(val):
+                    ax.text(
+                        bar.get_x() + bar.get_width() / 2,
+                        bar.get_height() + 0.01,
+                        f"{val:.3f}",
+                        ha="center", va="bottom", fontsize=7,
+                    )
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(datasets_sub, rotation=20, ha="right")
+        ax.set_ylabel("Spearman R")
+        ax.set_ylim(0, 1.05)
+        ax.set_title(f"Task: {task}")
+        if len(ckpts_sub) > 1:
+            ax.legend(fontsize=7, loc="lower right")
+
+    plt.suptitle("Checkpoint comparison - Spearman R", fontsize=11)
+    plt.tight_layout()
+    comp_path = out_dir / "plots" / f"comparison_{run_id}.png"
+    comp_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(comp_path, dpi=150)
+    plt.close()
+    print(f"Comparison chart -> {comp_path.resolve()}")
 
 
 # ── Default checkpoints per task ──────────────────────────────────────────────
@@ -434,7 +605,6 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="DSMBind evaluation pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
     )
     p.add_argument(
         "--task",
@@ -506,7 +676,7 @@ def main():
         ckpts = args.checkpoint or DEFAULT_CKPTS.get(task, [])
         ckpts = [c for c in ckpts if os.path.exists(c)]
         if not ckpts:
-            print(f"\nNo valid checkpoint found for task '{task}' — skipping.")
+            print(f"\nNo valid checkpoint found for task '{task}' - skipping.")
             continue
 
         print(f"\n{'=' * 60}")
@@ -525,7 +695,8 @@ def main():
         all_rows.extend(rows)
         all_summaries.extend(summaries)
 
-    save_outputs(all_rows, all_summaries, out_dir, run_id)
+    csv_path = save_outputs(all_rows, all_summaries, out_dir, run_id)
+    analyze_results(csv_path, out_dir, run_id)
     print(f"\nDone.  Run ID: {run_id}")
 
 
